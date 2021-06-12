@@ -9,7 +9,7 @@ from torch.optim import Adam
 from data import Dataset, Tree, Field, RawField, ChartField
 import argparse
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
-from node import Node, draw_tree
+from node import Node, draw_tree, from_string
 
 
 class Metric(object):
@@ -250,11 +250,31 @@ class CRFConstituency(nn.Module):
             # [batch_size, n]
             diag_mask = mask.diagonal(offset)
 
+            diag_score = scores.diagonal(offset) # [n_labels, batch_size, n] # contains all i (in n)
+            # diag_score[diag_mask.unsqueeze(0).repeat(n_labels,1,1)]
+            temp = torch.logsumexp(diag_score, dim = 0) # [batch_size, n] # over all the labels # logsumexp(score[i,j,*]) for all n spans
+
             ##### TODO   
-            # if d == 2:
+            if d == 2:
+              s.diagonal(offset).copy_(temp) # save the split label
             #    DO something 
-            # else:
+            else:
             #    DO something
+              ######## S[i,k] + S[k+1, j]
+              # mask s*mask.float()
+              s_span = stripe(s, n, offset-1, (0, 1)) + stripe(s, n, offset-1, (1, offset), 0) 
+              
+              
+              # all span with same length, there are total n such spans, longer span has less shift
+              # offset-1: number of ways to split
+              # [batch_size, n, offset] 
+              s_span = s_span.permute(2, 0, 1) # d=3, s_span=torch.Size([batch_size, n, offset-1]) # offset is the possible ways to split
+              #print(temp.unsqueeze(-1).size())
+              #print(s_span.size())
+
+              sum_score = torch.logsumexp(temp.unsqueeze(-1)+ s_span, dim = -1) #[batch_size, n, offset-1] # broadcast
+              #print(sum_score.size(), 'sum_score')
+              s.diagonal(offset).copy_(sum_score) 
 
         return s
 
@@ -476,7 +496,9 @@ class Model(nn.Module):
 def train(model, traindata, devdata, optimizer):
     elapsed = timedelta()
     best_e, best_metric = 1, Metric()
-
+    lossout = open(args.save_path+'.loss.txt', 'w')
+    metricout = open(args.save_path+'.metric.txt', 'w')
+    
     for epoch in range(1, args.epochs + 1):
         start = datetime.now()
 
@@ -497,9 +519,12 @@ def train(model, traindata, devdata, optimizer):
             optimizer.zero_grad()
             if i % 50 == 0:
                 print(f"{i} iter of epoch {epoch}, loss: {loss:.4f}")
+                lossout.write(f'train,{epoch},{loss},{i}\n')
         
-        loss, dev_metric = evaluate(model, devdata.loader)
+        loss, dev_metric = evaluate(model, devdata.loader, setname = 'dev', epoch = epoch)
         print(f"{'dev:':5} loss: {loss:.4f} - {dev_metric}")
+        lossout.write(f'dev,{epoch},{loss},{i}\n')
+        metricout.write(f'{epoch},{dev_metric},{loss}\n')
 
         t = datetime.now() - start
         if dev_metric > best_metric:
@@ -509,6 +534,7 @@ def train(model, traindata, devdata, optimizer):
         print(f"Epoch {best_e} saved")
         print(f"{'dev:':5} {best_metric}")
         print(f"{elapsed}s elapsed, {elapsed / epoch}s/epoch")
+        
 
 def convert_to_viz_tree(tree, sen):
     tree = sorted(tree, key=lambda x: x[1]-x[0])
@@ -534,12 +560,13 @@ def convert_to_viz_tree(tree, sen):
 
 
 @torch.no_grad()
-def evaluate(model, loader):
+def evaluate(model, loader, setname = 'dev', epoch = 0):
 
     model.eval()
 
     total_loss, metric = 0, SpanMetric()
 
+    i = 0
     for words, *feats, trees, charts in loader:
         # mask out the lower left triangle     
         word_mask = words.ne(args.pad_index)[:, 1:]
@@ -555,24 +582,30 @@ def evaluate(model, loader):
                     for tree, chart in zip(trees, chart_preds)]
         total_loss += loss.item()
 
-        if args.draw_pred: ### draw trees here
-            filter_delete = lambda x: [it for it in x if it not in args.delete]
-            trees_fact = [Tree.factorize(tree, args.delete, args.equal) for tree in preds]
-            leaves = [filter_delete(tree.leaves()) for tree in trees]
-            t = convert_to_viz_tree(tree=trees_fact[0], sen=leaves[0])
+        if args.draw_pred and i < 5: ### draw trees here
+          try:
+              filter_delete = lambda x: [it for it in x if it not in args.delete]
+              trees_fact = [Tree.factorize(tree, args.delete, args.equal) for tree in preds]
+              leaves = [filter_delete(tree.leaves()) for tree in trees]
+              t = convert_to_viz_tree(tree=trees_fact[0], sen=leaves[0])
 
-            draw_tree(t, res_path="./prediction")
+              draw_tree(t, res_path="./prediction_{}_{}_{}".format(epoch, setname, i))
+          except:
+            pass
 
         metric([Tree.factorize(tree, args.delete, args.equal) for tree in preds],
                 [Tree.factorize(tree, args.delete, args.equal) for tree in trees])
+        i +=1
     total_loss /= len(loader)
 
     return total_loss, metric
 
 @torch.no_grad()
-def predict(model, loader):
+def predict(model, loader, setname = 'test'):
     model.eval()
-
+    #ground_truth = []
+    #predictions = []
+    i = 0
     preds = {'trees': [], 'probs': []}
     for words, *feats, trees, charts in loader:
         word_mask = words.ne(args.pad_index)[:, 1:]
@@ -584,14 +617,27 @@ def predict(model, loader):
         chart_preds = model.decode(s_feat, mask)
         preds['trees'].extend([Tree.build(tree, [(i, j, CHART.vocab[label]) for i, j, label in chart])
                                 for tree, chart in zip(trees, chart_preds)])
+        #ground_truth.append(trees[0]._pformat_flat("", "()", False))
+        #predictions.append(preds[0]._pformat_flat("", "()", False))
 
-        if args.draw_pred: ### draw trees here
-            filter_delete = lambda x: [it for it in x if it not in args.delete]
-            trees_fact = [Tree.factorize(tree, args.delete, args.equal) for tree in preds['trees']]
-            leaves = [filter_delete(tree.leaves()) for tree in trees]
-            t = convert_to_viz_tree(tree=trees_fact[0], sen=leaves[0])
+        if args.draw_pred and i>1 and i < 5: ### draw trees here
+            #filter_delete = lambda x: [it for it in x if it not in args.delete]
+            #trees_fact = [Tree.factorize(tree, args.delete, args.equal) for tree in preds['trees']]
+            #leaves = [filter_delete(tree.leaves()) for tree in trees]
+            #t = convert_to_viz_tree(tree=trees_fact[0], sen=leaves[0])
 
-            draw_tree(t, res_path="./prediction")
+            #draw_tree(t, res_path="./prediction_{}_{}".format(setname, i))
+
+
+            # ground truth
+            print(i)
+            gtree = trees[0]._pformat_flat("", "()", False)
+            draw_tree(from_string(gtree), res_path="./ground_{}_{}".format(setname, i))
+            ptree = preds['trees'][0]._pformat_flat("", "()", False)
+            draw_tree(from_string(ptree), res_path="./predict_{}_{}".format(setname, i))
+            
+
+        i+=1
 
     return preds
 
@@ -619,6 +665,7 @@ if __name__ == "__main__":
     p.add_argument('--weight-decay', default=1e-5, type=float, help='learning rate, weight decay')
     p.add_argument('--clip', default=5., type=float, help='gradient clipping')
     p.add_argument('--draw_pred', default=False, type=bool, help='visualize prediction')
+    p.add_argument('--save_path', type=str, help='path to save model')
 
 
     args = p.parse_args()
@@ -669,6 +716,8 @@ if __name__ == "__main__":
     print(f"\n{'train:':6} {traindata}\n{'dev:':6} {devdata}\n{'test:':6} {testdata}\n")
     optimizer = Adam(model.parameters(), args.lr, (args.mu, args.nu), args.eps, args.weight_decay)
     train(model, traindata, devdata, optimizer)
-    evaluate(model, testdata.loader)
+    evaluate(model, testdata.loader, setname = 'test')
 
-    predict(model, testdata.loader)
+    predict(model, testdata.loader, setname = 'test')
+
+    torch.save(model.state_dict(), args.save_path)
